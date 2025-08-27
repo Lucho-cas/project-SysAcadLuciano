@@ -59,14 +59,26 @@ def user_list(request):
     """
     users = CustomUser.objects.all()
     return render(request, "users/user_list.html", {"users": users})
+ROLE_FORM_MAP = {
+    CustomUser.Role.STUDENT: StudentProfileForm,
+    CustomUser.Role.PROFESSOR: ProfessorProfileForm,
+    CustomUser.Role.ADMIN: AdministratorProfileForm,
+}
 
+def get_profile(role, data=None, instance=None):
+    form_class = ROLE_FORM_MAP.get(role)
+    if not form_class:
+        return None
+    return form_class(data, instance=instance)
 
 @login_required
 @user_passes_test(is_admin)
 def user_create(request):
     """
     Create a new user and optional role-specific profile.
+    """
 
+    """
     Behavior:
         - Determines selected role from POST.
         - Validates UserForm and the matching profile form.
@@ -75,127 +87,88 @@ def user_create(request):
     Returns:
         HttpResponse: Redirect to list on success or form page on error.
     """
-    selected_role = None
-    if request.method == "POST":
-        user_form = UserForm(request.POST)
-        selected_role = request.POST.get("role")
-        student_profile_form = StudentProfileForm(request.POST)
-        professor_profile_form = ProfessorProfileForm(request.POST)
-        administrator_profile_form = AdministratorProfileForm(request.POST)
+@login_required
+@user_passes_test(is_admin)
+def user_create(request):
+    """
+    Create a new user and optional role-specific profile.
+    """
+    selected_role = request.POST.get("role") if request.method == "POST" else None
+    user_form = UserForm(request.POST or None)
+    profile_form = get_profile(selected_role, request.POST if request.method == "POST" else None)
 
-        if selected_role == CustomUser.Role.STUDENT:
-            profile_form = student_profile_form
-        elif selected_role == CustomUser.Role.PROFESSOR:
-            profile_form = professor_profile_form
-        elif selected_role == CustomUser.Role.ADMIN:
-            profile_form = administrator_profile_form
-        else:
-            profile_form = None
+    if request.method == "POST" and user_form.is_valid() and (profile_form is None or profile_form.is_valid()):
+        with transaction.atomic():
+            user = user_form.save()
+            if profile_form is not None:
+                profile = profile_form.save(commit=False)
+                profile.user = user
+                profile.save()
+        messages.success(request, "Usuario creado correctamente.")
+        return redirect("users:user-list")
 
-        if user_form.is_valid() and (profile_form is None or profile_form.is_valid()):
-            with transaction.atomic():
-                user = user_form.save()
-                if profile_form is not None:
-                    profile = profile_form.save(commit=False)
-                    profile.user = user
-                    profile.save()
-            messages.success(request, "Usuario creado correctamente.")
-            return redirect("users:user-list")
-    else:
-        user_form = UserForm()
-        student_profile_form = StudentProfileForm()
-        professor_profile_form = ProfessorProfileForm()
-        administrator_profile_form = AdministratorProfileForm()
     return render(request, "users/user_form.html", {
-            "user_form": user_form,
-            "student_profile_form": student_profile_form,
-            "professor_profile_form": professor_profile_form,
-            "administrator_profile_form": administrator_profile_form,
-            "selected_role": selected_role})
-
+        "user_form": user_form,
+        "student_profile_form": get_profile(CustomUser.Role.STUDENT),
+        "professor_profile_form": get_profile(CustomUser.Role.PROFESSOR),
+        "administrator_profile_form": get_profile(CustomUser.Role.ADMIN),
+        "selected_role": selected_role,
+    })
 
 @login_required
 @user_passes_test(is_admin)
 def user_edit(request, pk):
     """
     Update a user and its role-specific profile.
-
-    Behavior:
-        - Saves UserForm, swaps/creates/deletes related profile based on chosen role.
-        - All operations are transactional.
-
-    Args:
-        pk (int): User primary key.
-
-    Returns:
-        HttpResponse: Redirect to list on success or form page on error.
     """
     user = get_object_or_404(CustomUser, pk=pk)
     if request.method == "POST":
         user_form = UserForm(request.POST, instance=user)
         if user_form.is_valid():
             role = user_form.cleaned_data["role"]
-            student_instance = (getattr(user, "student", None) if role == CustomUser.Role.STUDENT else None)
-            professor_instance = (getattr(user, "professor", None) if role == CustomUser.Role.PROFESSOR else None)
-            administrator_instance = (getattr(user, "administrator", None) if role == CustomUser.Role.ADMIN else None)
 
-            student_profile_form = StudentProfileForm(request.POST, instance=student_instance)
-            professor_profile_form = ProfessorProfileForm(request.POST, instance=professor_instance)
-            administrator_profile_form = AdministratorProfileForm(request.POST, instance=administrator_instance)
-
-            if role == CustomUser.Role.STUDENT:
-                profile_form = student_profile_form
-            elif role == CustomUser.Role.PROFESSOR:
-                profile_form = professor_profile_form
-            elif role == CustomUser.Role.ADMIN:
-                profile_form = administrator_profile_form
-            else:
-                profile_form = None
+            # Instancia actual del perfil (si existe)
+            instance = getattr(user, role.lower(), None)
+            profile_form = get_profile(role, request.POST, instance=instance)
 
             if profile_form is None or profile_form.is_valid():
                 with transaction.atomic():
                     user = user_form.save()
-                    if role != CustomUser.Role.STUDENT and getattr(
-                        user, "student", None
-                    ):
+                    # Eliminar perfiles de roles anteriores
+                    if role != CustomUser.Role.STUDENT and getattr(user, "student", None):
                         user.student.delete()
-                    if role != CustomUser.Role.PROFESSOR and getattr(
-                        user, "professor", None
-                    ):
+                    if role != CustomUser.Role.PROFESSOR and getattr(user, "professor", None):
                         user.professor.delete()
-                    if role != CustomUser.Role.ADMIN and getattr(
-                        user, "administrator", None
-                    ):
+                    if role != CustomUser.Role.ADMIN and getattr(user, "administrator", None):
                         user.administrator.delete()
+
+                    # Guardar el perfil nuevo/actualizado
                     if profile_form is not None:
                         profile = profile_form.save(commit=False)
                         profile.user = user
                         profile.save()
+
                 messages.success(request, "Usuario actualizado correctamente.")
                 return redirect("users:user-list")
 
+        # Si falla validación, recargar formularios
         posted_role = request.POST.get("role")
-        student_profile_form = StudentProfileForm(request.POST)
-        professor_profile_form = ProfessorProfileForm(request.POST)
-        administrator_profile_form = AdministratorProfileForm(request.POST)
         return render(request, "users/user_form.html", {
-                "user_form": user_form,
-                "student_profile_form": student_profile_form,
-                "professor_profile_form": professor_profile_form,
-                "administrator_profile_form": administrator_profile_form,
-                "selected_role": posted_role})
+            "user_form": user_form,
+            "student_profile_form": get_profile(CustomUser.Role.STUDENT, request.POST),
+            "professor_profile_form": get_profile(CustomUser.Role.PROFESSOR, request.POST),
+            "administrator_profile_form": get_profile(CustomUser.Role.ADMIN, request.POST),
+            "selected_role": posted_role,
+        })
     else:
         user_form = UserForm(instance=user)
-        student_profile_form = StudentProfileForm(instance=getattr(user, "student", None))
-        professor_profile_form = ProfessorProfileForm(instance=getattr(user, "professor", None))
-        administrator_profile_form = AdministratorProfileForm(instance=getattr(user, "administrator", None))
         return render(request, "users/user_form.html", {
-                "user_form": user_form,
-                "student_profile_form": student_profile_form,
-                "professor_profile_form": professor_profile_form,
-                "administrator_profile_form": administrator_profile_form,
-                "selected_role": user.role})
-
+            "user_form": user_form,
+            "student_profile_form": get_profile(CustomUser.Role.STUDENT, instance=getattr(user, "student", None)),
+            "professor_profile_form": get_profile(CustomUser.Role.PROFESSOR, instance=getattr(user, "professor", None)),
+            "administrator_profile_form": get_profile(CustomUser.Role.ADMIN, instance=getattr(user, "administrator", None)),
+            "selected_role": user.role,
+        })
 
 @login_required
 @user_passes_test(is_admin)
