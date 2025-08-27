@@ -1,3 +1,4 @@
+# users/views.py
 """Views for Users app: admin, student, and professor workflows.
 
 Includes:
@@ -21,7 +22,14 @@ from django.contrib.auth.decorators import login_required, user_passes_test
 from django.db import transaction
 from django.http import HttpResponse
 from django.shortcuts import get_object_or_404, redirect, render
+from django.urls import reverse_lazy
 from django.utils import timezone
+from django.views.generic import (
+    CreateView,
+    DeleteView,
+    ListView,
+    UpdateView,
+)
 
 from academics.forms import CareerForm, FacultyForm, FinalExamForm, GradeForm, SubjectForm
 from academics.models import Career, Faculty, FinalExam, Grade, Subject
@@ -30,385 +38,246 @@ from users.forms import AdministratorProfileForm, ProfessorProfileForm, StudentP
 from users.models import CustomUser, Professor, Student
 
 
-# --------- Admin Views -------
+# --------- Permisos y Clases Base ---------
 def is_admin(user):
     """Return True if the user is authenticated and has administrator role."""
     return user.is_authenticated and user.role == CustomUser.Role.ADMIN
 
 
+class BaseAdminView:
+    """Clase base para vistas de administración que aplica permisos.
+    
+    Esto cumple con el principio DRY al centralizar la lógica de permisos.
+    """
+
+    @classmethod
+    def as_view(cls, **initkwargs):
+        view = super().as_view(**initkwargs)
+        return user_passes_test(is_admin)(login_required(view))
+
+
+# --------- Vistas de Admin (refactorizadas) -------
 @login_required
 @user_passes_test(is_admin)
 def admin_dashboard(request):
     """
     Render the admin dashboard.
-
-    Returns:
-        HttpResponse: Admin dashboard page.
     """
     return render(request, "users/admin_dashboard.html")
 
 
-@login_required
-@user_passes_test(is_admin)
-def user_list(request):
-    """
-    List all users.
+class UserListView(BaseAdminView, ListView):
+    """Lista todos los usuarios."""
+    model = CustomUser
+    template_name = "users/user_list.html"
+    context_object_name = "users"
 
-    Returns:
-        HttpResponse: Page with user queryset.
-    """
-    users = CustomUser.objects.all()
-    return render(request, "users/user_list.html", {"users": users})
-ROLE_FORM_MAP = {
-    CustomUser.Role.STUDENT: StudentProfileForm,
-    CustomUser.Role.PROFESSOR: ProfessorProfileForm,
-    CustomUser.Role.ADMIN: AdministratorProfileForm,
-}
 
-def get_profile(role, data=None, instance=None):
-    form_class = ROLE_FORM_MAP.get(role)
-    if not form_class:
-        return None
-    return form_class(data, instance=instance)
+class UserCreateView(BaseAdminView, CreateView):
+    """Crea un nuevo usuario y su perfil asociado."""
+    model = CustomUser
+    form_class = UserForm
+    template_name = "users/user_form.html"
+    success_url = reverse_lazy("users:user-list")
 
-@login_required
-@user_passes_test(is_admin)
-def user_create(request):
-    """
-    Create a new user and optional role-specific profile.
-    """
+    def get_context_data(self, **kwargs):
+        context = super().get_context_data(**kwargs)
+        if self.request.POST:
+            context["user_form"] = UserForm(self.request.POST)
+            context["student_profile_form"] = StudentProfileForm(self.request.POST)
+            context["professor_profile_form"] = ProfessorProfileForm(self.request.POST)
+            context["administrator_profile_form"] = AdministratorProfileForm(self.request.POST)
+            context["selected_role"] = self.request.POST.get("role")
+        else:
+            context["user_form"] = UserForm()
+            context["student_profile_form"] = StudentProfileForm()
+            context["professor_profile_form"] = ProfessorProfileForm()
+            context["administrator_profile_form"] = AdministratorProfileForm()
+            context["selected_role"] = None
+        return context
 
-    """
-    Behavior:
-        - Determines selected role from POST.
-        - Validates UserForm and the matching profile form.
-        - Creates both inside an atomic transaction.
+    def form_valid(self, user_form):
+        selected_role = self.request.POST.get("role")
+        profile_form = None
+        if selected_role == CustomUser.Role.STUDENT:
+            profile_form = StudentProfileForm(self.request.POST)
+        elif selected_role == CustomUser.Role.PROFESSOR:
+            profile_form = ProfessorProfileForm(self.request.POST)
+        elif selected_role == CustomUser.Role.ADMIN:
+            profile_form = AdministratorProfileForm(self.request.POST)
 
-    Returns:
-        HttpResponse: Redirect to list on success or form page on error.
-    """
-@login_required
-@user_passes_test(is_admin)
-def user_create(request):
-    """
-    Create a new user and optional role-specific profile.
-    """
-    selected_role = request.POST.get("role") if request.method == "POST" else None
-    user_form = UserForm(request.POST or None)
-    profile_form = get_profile(selected_role, request.POST if request.method == "POST" else None)
+        if profile_form is None or profile_form.is_valid():
+            with transaction.atomic():
+                user = user_form.save()
+                if profile_form:
+                    profile = profile_form.save(commit=False)
+                    profile.user = user
+                    profile.save()
+            messages.success(self.request, "Usuario creado correctamente.")
+            return redirect(self.success_url)
+        return self.form_invalid(user_form)
 
-    if request.method == "POST" and user_form.is_valid() and (profile_form is None or profile_form.is_valid()):
+
+class UserUpdateView(BaseAdminView, UpdateView):
+    """Actualiza un usuario y su perfil asociado."""
+    model = CustomUser
+    form_class = UserForm
+    template_name = "users/user_form.html"
+    success_url = reverse_lazy("users:user-list")
+
+    def get_context_data(self, **kwargs):
+        context = super().get_context_data(**kwargs)
+        user = self.get_object()
+        if self.request.POST:
+            posted_role = self.request.POST.get("role")
+            context["student_profile_form"] = StudentProfileForm(self.request.POST, instance=getattr(user, "student", None))
+            context["professor_profile_form"] = ProfessorProfileForm(self.request.POST, instance=getattr(user, "professor", None))
+            context["administrator_profile_form"] = AdministratorProfileForm(self.request.POST, instance=getattr(user, "administrator", None))
+            context["selected_role"] = posted_role
+        else:
+            context["user_form"] = UserForm(instance=user)
+            context["student_profile_form"] = StudentProfileForm(instance=getattr(user, "student", None))
+            context["professor_profile_form"] = ProfessorProfileForm(instance=getattr(user, "professor", None))
+            context["administrator_profile_form"] = AdministratorProfileForm(instance=getattr(user, "administrator", None))
+            context["selected_role"] = user.role
+        return context
+
+    def form_valid(self, form):
+        user = self.get_object()
+        role = form.cleaned_data["role"]
+
+        if role != user.role:
+            if getattr(user, "student", None):
+                user.student.delete()
+            if getattr(user, "professor", None):
+                user.professor.delete()
+            if getattr(user, "administrator", None):
+                user.administrator.delete()
+            messages.info(self.request, "El perfil anterior ha sido eliminado debido al cambio de rol.")
+
         with transaction.atomic():
-            user = user_form.save()
-            if profile_form is not None:
-                profile = profile_form.save(commit=False)
-                profile.user = user
-                profile.save()
-        messages.success(request, "Usuario creado correctamente.")
-        return redirect("users:user-list")
+            user = form.save()
+            profile_form = None
+            if role == CustomUser.Role.STUDENT:
+                profile_form = StudentProfileForm(self.request.POST)
+            elif role == CustomUser.Role.PROFESSOR:
+                profile_form = ProfessorProfileForm(self.request.POST)
+            elif role == CustomUser.Role.ADMIN:
+                profile_form = AdministratorProfileForm(self.request.POST)
 
-    return render(request, "users/user_form.html", {
-        "user_form": user_form,
-        "student_profile_form": get_profile(CustomUser.Role.STUDENT),
-        "professor_profile_form": get_profile(CustomUser.Role.PROFESSOR),
-        "administrator_profile_form": get_profile(CustomUser.Role.ADMIN),
-        "selected_role": selected_role,
-    })
+            if profile_form:
+                if profile_form.is_valid():
+                    profile = profile_form.save(commit=False)
+                    profile.user = user
+                    profile.save()
+                else:
+                    return self.form_invalid(form)
 
-@login_required
-@user_passes_test(is_admin)
-def user_edit(request, pk):
-    """
-    Update a user and its role-specific profile.
-    """
-    user = get_object_or_404(CustomUser, pk=pk)
-    if request.method == "POST":
-        user_form = UserForm(request.POST, instance=user)
-        if user_form.is_valid():
-            role = user_form.cleaned_data["role"]
-
-            # Instancia actual del perfil (si existe)
-            instance = getattr(user, role.lower(), None)
-            profile_form = get_profile(role, request.POST, instance=instance)
-
-            if profile_form is None or profile_form.is_valid():
-                with transaction.atomic():
-                    user = user_form.save()
-                    # Eliminar perfiles de roles anteriores
-                    if role != CustomUser.Role.STUDENT and getattr(user, "student", None):
-                        user.student.delete()
-                    if role != CustomUser.Role.PROFESSOR and getattr(user, "professor", None):
-                        user.professor.delete()
-                    if role != CustomUser.Role.ADMIN and getattr(user, "administrator", None):
-                        user.administrator.delete()
-
-                    # Guardar el perfil nuevo/actualizado
-                    if profile_form is not None:
-                        profile = profile_form.save(commit=False)
-                        profile.user = user
-                        profile.save()
-
-                messages.success(request, "Usuario actualizado correctamente.")
-                return redirect("users:user-list")
-
-        # Si falla validación, recargar formularios
-        posted_role = request.POST.get("role")
-        return render(request, "users/user_form.html", {
-            "user_form": user_form,
-            "student_profile_form": get_profile(CustomUser.Role.STUDENT, request.POST),
-            "professor_profile_form": get_profile(CustomUser.Role.PROFESSOR, request.POST),
-            "administrator_profile_form": get_profile(CustomUser.Role.ADMIN, request.POST),
-            "selected_role": posted_role,
-        })
-    else:
-        user_form = UserForm(instance=user)
-        return render(request, "users/user_form.html", {
-            "user_form": user_form,
-            "student_profile_form": get_profile(CustomUser.Role.STUDENT, instance=getattr(user, "student", None)),
-            "professor_profile_form": get_profile(CustomUser.Role.PROFESSOR, instance=getattr(user, "professor", None)),
-            "administrator_profile_form": get_profile(CustomUser.Role.ADMIN, instance=getattr(user, "administrator", None)),
-            "selected_role": user.role,
-        })
-
-@login_required
-@user_passes_test(is_admin)
-def user_delete(request, pk):
-    """
-    Delete a user after confirmation.
-
-    Args:
-        pk (int): User primary key.
-
-    Returns:
-        HttpResponse: Confirmation page (GET) or redirect (POST).
-    """
-    user = get_object_or_404(CustomUser, pk=pk)
-    if request.method == "POST":
-        user.delete()
-        return redirect("users:user-list")
-    return render(request, "users/confirm_delete.html", {"user": user})
+        messages.success(self.request, "Usuario actualizado correctamente.")
+        return redirect(self.success_url)
 
 
-@login_required
-@user_passes_test(is_admin)
-def faculty_list(request):
-    """
-    List faculties.
-
-    Returns:
-        HttpResponse: Page with faculties queryset.
-    """
-    faculties = Faculty.objects.all()
-    return render(request, "users/faculty_list.html", {"faculties": faculties})
+class UserDeleteView(BaseAdminView, DeleteView):
+    """Elimina un usuario después de la confirmación."""
+    model = CustomUser
+    template_name = "users/confirm_delete.html"
+    success_url = reverse_lazy("users:user-list")
+    context_object_name = "user"
 
 
-@login_required
-@user_passes_test(is_admin)
-def faculty_create(request):
-    """
-    Create a faculty.
-
-    Returns:
-        HttpResponse: Redirect on success or form page on error.
-    """
-    if request.method == "POST":
-        form = FacultyForm(request.POST)
-        if form.is_valid():
-            form.save()
-            return redirect("users:faculty-list")
-    else:
-        form = FacultyForm()
-    return render(request, "users/faculty_form.html", {"form": form})
+# Vistas CRUD para los modelos Académicos
+class FacultyListView(BaseAdminView, ListView):
+    model = Faculty
+    template_name = "users/faculty_list.html"
+    context_object_name = "faculties"
 
 
-@login_required
-@user_passes_test(is_admin)
-def faculty_edit(request, code):
-    """
-    Edit a faculty.
-
-    Args:
-        code (str): Faculty code (PK).
-
-    Returns:
-        HttpResponse: Redirect on success or form page on error.
-    """
-    faculty = get_object_or_404(Faculty, code=code)
-    if request.method == "POST":
-        form = FacultyForm(request.POST, instance=faculty)
-        if form.is_valid():
-            form.save()
-            return redirect("users:faculty-list")
-    else:
-        form = FacultyForm(instance=faculty)
-    return render(request, "users/faculty_form.html", {"form": form})
+class FacultyCreateView(BaseAdminView, CreateView):
+    model = Faculty
+    form_class = FacultyForm
+    template_name = "users/faculty_form.html"
+    success_url = reverse_lazy("users:faculty-list")
 
 
-@login_required
-@user_passes_test(is_admin)
-def faculty_delete(request, code):
-    """
-    Delete a faculty after confirmation.
-
-    Args:
-        code (str): Faculty code (PK).
-
-    Returns:
-        HttpResponse: Confirmation page (GET) or redirect (POST).
-    """
-    faculty = get_object_or_404(Faculty, code=code)
-    if request.method == "POST":
-        faculty.delete()
-        return redirect("users:faculty-list")
-    return render(request, "users/confirm_delete.html", {"object": faculty, "back": "users:faculty-list"})
+class FacultyUpdateView(BaseAdminView, UpdateView):
+    model = Faculty
+    form_class = FacultyForm
+    template_name = "users/faculty_form.html"
+    success_url = reverse_lazy("users:faculty-list")
+    slug_field = "code"
+    slug_url_kwarg = "code"
 
 
-@login_required
-@user_passes_test(is_admin)
-def career_list(request):
-    """
-    List careers.
-
-    Returns:
-        HttpResponse: Page with careers queryset.
-    """
-    careers = Career.objects.all()
-    return render(request, "users/career_list.html", {"careers": careers})
+class FacultyDeleteView(BaseAdminView, DeleteView):
+    model = Faculty
+    template_name = "users/confirm_delete.html"
+    success_url = reverse_lazy("users:faculty-list")
+    context_object_name = "object"
+    slug_field = "code"
+    slug_url_kwarg = "code"
 
 
-@login_required
-@user_passes_test(is_admin)
-def career_create(request):
-    """
-    Create a career.
-
-    Returns:
-        HttpResponse: Redirect on success or form page on error.
-    """
-    if request.method == "POST":
-        form = CareerForm(request.POST)
-        if form.is_valid():
-            form.save()
-            return redirect("users:career-list")
-    else:
-        form = CareerForm()
-    return render(request, "users/career_form.html", {"form": form})
+class CareerListView(BaseAdminView, ListView):
+    model = Career
+    template_name = "users/career_list.html"
+    context_object_name = "careers"
 
 
-@login_required
-@user_passes_test(is_admin)
-def career_edit(request, code):
-    """
-    Edit a career.
-
-    Args:
-        code (str): Career code (PK).
-
-    Returns:
-        HttpResponse: Redirect on success or form page on error.
-    """
-    career = get_object_or_404(Career, code=code)
-    if request.method == "POST":
-        form = CareerForm(request.POST, instance=career)
-        if form.is_valid():
-            form.save()
-            return redirect("users:career-list")
-    else:
-        form = CareerForm(instance=career)
-    return render(request, "users/career_form.html", {"form": form})
+class CareerCreateView(BaseAdminView, CreateView):
+    model = Career
+    form_class = CareerForm
+    template_name = "users/career_form.html"
+    success_url = reverse_lazy("users:career-list")
 
 
-@login_required
-@user_passes_test(is_admin)
-def career_delete(request, code):
-    """
-    Delete a career after confirmation.
-
-    Args:
-        code (str): Career code (PK).
-
-    Returns:
-        HttpResponse: Confirmation page (GET) or redirect (POST).
-    """
-    career = get_object_or_404(Career, code=code)
-    if request.method == "POST":
-        career.delete()
-        return redirect("users:career-list")
-    return render(request, "users/confirm_delete.html", {"object": career, "back": "users:career-list"})
+class CareerUpdateView(BaseAdminView, UpdateView):
+    model = Career
+    form_class = CareerForm
+    template_name = "users/career_form.html"
+    success_url = reverse_lazy("users:career-list")
+    slug_field = "code"
+    slug_url_kwarg = "code"
 
 
-@login_required
-@user_passes_test(is_admin)
-def subject_list(request):
-    """
-    List subjects.
-
-    Returns:
-        HttpResponse: Page with subjects queryset.
-    """
-    subjects = Subject.objects.select_related("career").all()
-    return render(request, "users/subject_list.html", {"subjects": subjects})
+class CareerDeleteView(BaseAdminView, DeleteView):
+    model = Career
+    template_name = "users/confirm_delete.html"
+    success_url = reverse_lazy("users:career-list")
+    context_object_name = "object"
+    slug_field = "code"
+    slug_url_kwarg = "code"
 
 
-@login_required
-@user_passes_test(is_admin)
-def subject_create(request):
-    """
-    Create a subject.
-
-    Returns:
-        HttpResponse: Redirect on success or form page on error.
-    """
-    if request.method == "POST":
-        form = SubjectForm(request.POST)
-        if form.is_valid():
-            form.save()
-            return redirect("users:subject-list")
-    else:
-        form = SubjectForm()
-    return render(request, "users/subject_form.html", {"form": form})
+class SubjectListView(BaseAdminView, ListView):
+    model = Subject
+    template_name = "users/subject_list.html"
+    context_object_name = "subjects"
+    queryset = Subject.objects.select_related("career").all()
 
 
-@login_required
-@user_passes_test(is_admin)
-def subject_edit(request, code):
-    """
-    Edit a subject.
-
-    Args:
-        code (str): Subject code (PK).
-
-    Returns:
-        HttpResponse: Redirect on success or form page on error.
-    """
-    subject = get_object_or_404(Subject, code=code)
-    if request.method == "POST":
-        form = SubjectForm(request.POST, instance=subject)
-        if form.is_valid():
-            form.save()
-            return redirect("users:subject-list")
-    else:
-        form = SubjectForm(instance=subject)
-    return render(request, "users/subject_form.html", {"form": form})
+class SubjectCreateView(BaseAdminView, CreateView):
+    model = Subject
+    form_class = SubjectForm
+    template_name = "users/subject_form.html"
+    success_url = reverse_lazy("users:subject-list")
 
 
-@login_required
-@user_passes_test(is_admin)
-def subject_delete(request, code):
-    """
-    Delete a subject after confirmation.
+class SubjectUpdateView(BaseAdminView, UpdateView):
+    model = Subject
+    form_class = SubjectForm
+    template_name = "users/subject_form.html"
+    success_url = reverse_lazy("users:subject-list")
+    slug_field = "code"
+    slug_url_kwarg = "code"
 
-    Args:
-        code (str): Subject code (PK).
 
-    Returns:
-        HttpResponse: Confirmation page (GET) or redirect (POST).
-    """
-    subject = get_object_or_404(Subject, code=code)
-    if request.method == "POST":
-        subject.delete()
-        return redirect("users:subject-list")
-    return render(request, "users/confirm_delete.html", {"object": subject, "back": "users:subject-list"})
+class SubjectDeleteView(BaseAdminView, DeleteView):
+    model = Subject
+    template_name = "users/confirm_delete.html"
+    success_url = reverse_lazy("users:subject-list")
+    context_object_name = "object"
+    slug_field = "code"
+    slug_url_kwarg = "code"
 
 
 @login_required
@@ -416,16 +285,9 @@ def subject_delete(request, code):
 def assign_subject_professors(request, code):
     """
     Assign/remove professors for a subject.
-
-    Args:
-        code (str): Subject code (PK).
-
-    Returns:
-        HttpResponse: Redirect to list after processing or form page (GET).
     """
     subject = get_object_or_404(Subject, code=code)
     if request.method == "POST":
-        # Professor primary key is a string (professor_id), keep as-is
         selected_ids = set(request.POST.getlist("professors"))
         current_ids = set(subject.professors.values_list("pk", flat=True))
 
@@ -447,78 +309,32 @@ def assign_subject_professors(request, code):
     return render(request, "users/assign_professors.html", {"subject": subject, "professors": profs})
 
 
-@login_required
-@user_passes_test(is_admin)
-def final_list(request):
-    """
-    List final exams.
-
-    Returns:
-        HttpResponse: Page with final exams queryset.
-    """
-    finals = FinalExam.objects.select_related("subject").all()
-    return render(request, "users/final_list.html", {"finals": finals})
+class FinalExamListView(BaseAdminView, ListView):
+    model = FinalExam
+    template_name = "users/final_list.html"
+    context_object_name = "finals"
+    queryset = FinalExam.objects.select_related("subject").all()
 
 
-@login_required
-@user_passes_test(is_admin)
-def final_create(request):
-    """
-    Create a final exam.
-
-    Returns:
-        HttpResponse: Redirect on success or form page on error.
-    """
-    if request.method == "POST":
-        form = FinalExamForm(request.POST)
-        if form.is_valid():
-            form.save()
-            return redirect("users:final-list")
-    else:
-        form = FinalExamForm()
-    return render(request, "users/final_form.html", {"form": form})
+class FinalExamCreateView(BaseAdminView, CreateView):
+    model = FinalExam
+    form_class = FinalExamForm
+    template_name = "users/final_form.html"
+    success_url = reverse_lazy("users:final-list")
 
 
-@login_required
-@user_passes_test(is_admin)
-def final_edit(request, pk):
-    """
-    Edit a final exam.
-
-    Args:
-        pk (int): FinalExam primary key.
-
-    Returns:
-        HttpResponse: Redirect on success or form page on error.
-    """
-    final = get_object_or_404(FinalExam, pk=pk)
-    if request.method == "POST":
-        form = FinalExamForm(request.POST, instance=final)
-        if form.is_valid():
-            form.save()
-            return redirect("users:final-list")
-    else:
-        form = FinalExamForm(instance=final)
-    return render(request, "users/final_form.html", {"form": form})
+class FinalExamUpdateView(BaseAdminView, UpdateView):
+    model = FinalExam
+    form_class = FinalExamForm
+    template_name = "users/final_form.html"
+    success_url = reverse_lazy("users:final-list")
 
 
-@login_required
-@user_passes_test(is_admin)
-def final_delete(request, pk):
-    """
-    Delete a final exam after confirmation.
-
-    Args:
-        pk (int): FinalExam primary key.
-
-    Returns:
-        HttpResponse: Confirmation page (GET) or redirect (POST).
-    """
-    final = get_object_or_404(FinalExam, pk=pk)
-    if request.method == "POST":
-        final.delete()
-        return redirect("users:final-list")
-    return render(request, "users/confirm_delete.html", {"object": final, "back": "users:final-list"})
+class FinalExamDeleteView(BaseAdminView, DeleteView):
+    model = FinalExam
+    template_name = "users/confirm_delete.html"
+    success_url = reverse_lazy("users:final-list")
+    context_object_name = "object"
 
 
 @login_required
@@ -526,16 +342,9 @@ def final_delete(request, pk):
 def assign_final_professors(request, pk):
     """
     Assign/remove professors for a final exam.
-
-    Args:
-        pk (int): FinalExam primary key.
-
-    Returns:
-        HttpResponse: Redirect to list after processing or form page (GET).
     """
     final = get_object_or_404(FinalExam, pk=pk)
     if request.method == "POST":
-        # Professor primary key is a string (professor_id), keep as-is
         selected_ids = set(request.POST.getlist("professors"))
         current_ids = set(final.professors.values_list("pk", flat=True))
 
@@ -557,7 +366,7 @@ def assign_final_professors(request, pk):
     return render(request, "users/assign_professors.html", {"final": final, "professors": profs})
 
 
-# ------- Student Views -------
+# ------- Vistas de Estudiantes -------
 def is_student(user):
     """Return True if the user is authenticated and has student role."""
     return user.is_authenticated and user.role == CustomUser.Role.STUDENT
@@ -568,18 +377,6 @@ def is_student(user):
 def student_dashboard(request):
     """
     Render student dashboard with subjects, grades, and inscriptions.
-
-    Context:
-        subjects: Career subjects for the student.
-        inscriptions: Subject inscriptions for the student.
-        grades: Grade queryset for the student.
-        eligible_finals: Finals where status is REGULAR.
-        final_inscriptions: Final exam inscriptions.
-        inscribed_final_ids: IDs of finals already inscribed.
-        inscribed_subject_codes: Codes of subjects already inscribed.
-
-    Returns:
-        HttpResponse: Dashboard page.
     """
     student = getattr(request.user, "student", None)
     if not student:
@@ -605,13 +402,13 @@ def student_dashboard(request):
     inscribed_final_ids = list(final_inscriptions.values_list("final_exam_id", flat=True))
 
     return render(request, "users/student_dashboard.html", {
-            "subjects": subjects,
-            "inscriptions": inscriptions,
-            "grades": grades,
-            "eligible_finals": eligible_finals,
-            "final_inscriptions": final_inscriptions,
-            "inscribed_final_ids": inscribed_final_ids,
-            "inscribed_subject_codes": inscribed_subject_codes})
+        "subjects": subjects,
+        "inscriptions": inscriptions,
+        "grades": grades,
+        "eligible_finals": eligible_finals,
+        "final_inscriptions": final_inscriptions,
+        "inscribed_final_ids": inscribed_final_ids,
+        "inscribed_subject_codes": inscribed_subject_codes})
 
 
 @login_required
@@ -619,12 +416,6 @@ def student_dashboard(request):
 def subject_inscribe(request, subject_code):
     """
     Create subject inscription and ensure grade record exists.
-
-    Args:
-        subject_code (str): Subject code (PK).
-
-    Returns:
-        HttpResponse: Confirmation page (GET) or redirect (POST).
     """
     student = request.user.student
     subject = get_object_or_404(Subject, code=subject_code, career=student.career)
@@ -645,12 +436,6 @@ def subject_inscribe(request, subject_code):
 def final_exam_inscribe(request, final_exam_id):
     """
     Create final exam inscription if the subject status is REGULAR.
-
-    Args:
-        final_exam_id (int): FinalExam primary key.
-
-    Returns:
-        HttpResponse: Confirmation page (GET) or redirect (POST).
     """
     student = request.user.student
     final_exam = get_object_or_404(FinalExam, pk=final_exam_id, subject__career=student.career)
@@ -723,7 +508,7 @@ def download_regular_certificate(request):
     return response
 
 
-# ------- Professor Views -------
+# ------- Vistas de Profesor -------
 def is_professor(user):
     """Return True if the user is authenticated and has professor role."""
     return user.is_authenticated and user.role == CustomUser.Role.PROFESSOR
@@ -734,9 +519,6 @@ def is_professor(user):
 def professor_dashboard(request):
     """
     Render professor dashboard with assigned subjects and finals.
-
-    Returns:
-        HttpResponse: Dashboard page.
     """
     professor = getattr(request.user, "professor", None)
     if not professor:
@@ -752,12 +534,6 @@ def professor_dashboard(request):
 def grade_list(request, subject_code):
     """
     List grades for a subject and backfill missing Grade entries.
-
-    Args:
-        subject_code (str): Subject code (PK) assigned to the professor.
-
-    Returns:
-        HttpResponse: Page with grades queryset.
     """
     professor = request.user.professor
     subject = get_object_or_404(Subject, code=subject_code, professors=professor)
@@ -780,16 +556,6 @@ def grade_list(request, subject_code):
 def grade_edit(request, pk):
     """
     Edit a grade record for a student in a professor's subject.
-
-    Guards:
-        - Professor must be assigned to the subject.
-        - Student must be inscribed in the subject.
-
-    Args:
-        pk (int): Grade primary key.
-
-    Returns:
-        HttpResponse: Redirect to grade list on success or form page on error.
     """
     grade = get_object_or_404(Grade, pk=pk)
     if grade.subject not in request.user.professor.subjects.all():
@@ -817,12 +583,6 @@ def grade_edit(request, pk):
 def professor_final_inscriptions(request, final_exam_id):
     """
     List final exam inscriptions assigned to the professor.
-
-    Args:
-        final_exam_id (int): FinalExam primary key.
-
-    Returns:
-        HttpResponse: Page with inscriptions queryset.
     """
     professor = request.user.professor
     final_exam = get_object_or_404(FinalExam, id=final_exam_id, professors=professor)
@@ -833,3 +593,62 @@ def professor_final_inscriptions(request, final_exam_id):
     )
     return render(request, "users/professor_final_inscriptions.html", {
         "final_exam": final_exam, "inscriptions": inscriptions})
+
+
+import json
+from django.template.loader import render_to_string
+from django.http import HttpResponse, JsonResponse
+from django.views import View
+
+from users.services import StudentFileService # Importa el nuevo servicio
+from users.models import CustomUser, Student # Asegúrate de que Student esté importado
+
+
+# ... (resto del código de views.py) ...
+
+
+# --------- Vistas para la Ficha del Alumno (SOLID) ---------
+class StudentFileDocxView(View):
+    """
+    Vista para generar la Ficha del Alumno en formato DOCX.
+    
+    Responsabilidad única: generar el archivo Word a partir de los datos.
+    """
+    def get(self, request, student_id):
+        student_data = StudentFileService.get_student_file_data(student_id)
+        if not student_data:
+            messages.error(request, "Ficha de Alumno no encontrada.")
+            return redirect('users:student-dashboard')
+
+        doc_path = Path(settings.BASE_DIR) /"ficha_alumno.docx"
+        if not doc_path.exists():
+            messages.error(request, "No se encontró la plantilla de la Ficha del Alumno.")
+            return redirect('users:student-dashboard')
+
+        try:
+            doc = DocxTemplate(str(doc_path))
+            doc.render(student_data)
+            output = BytesIO()
+            doc.save(output)
+            output.seek(0)
+            
+            filename = f"ficha_alumno_{student_id}.docx"
+            response = HttpResponse(
+                output.getvalue(),
+                content_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            )
+            response["Content-Disposition"] = f'attachment; filename="{filename}"'
+            return response
+        
+        except Exception as e:
+            messages.error(request, f"Ocurrió un error al generar la Ficha: {e}")
+            return redirect('users:student-dashboard')
+
+
+class StudentFileJSONView(View):
+    
+    def get(self, request, student_id):
+        student_data = StudentFileService.get_student_file_data(student_id)
+        if not student_data:
+            return JsonResponse({'error': 'Ficha de Alumno no encontrada.'}, status=404)
+        return JsonResponse(student_data)
